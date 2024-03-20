@@ -1,0 +1,356 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+Predicting Transmembrane Proteins
+=================================
+
+In this exercise we're going to try to predict which proteins have transmembrane segments based on some basic annotation and composition information.  There are more specialised programs which would be more directly suited to doing this but we can try a machine learning approach to see how well that works.
+
+Loading Packages
+================
+
+```{r message=FALSE}
+library(tidyverse)
+theme_set(theme_bw())
+library(tidymodels)
+tidymodels_prefer()
+```
+
+Loading Data
+============
+
+We have prepared the input data already
+
+```{r message=FALSE}
+read_delim("../transmembrane_data.txt") -> data
+
+head(data)
+```
+
+The column we want to predict is "transmembrane".  We have various other pieces of information which might be useful.
+
+Preparing Data
+==============
+
+Some of the columns are not going to be useful for the modelling.  Specifically the gene_id is not useful so we're going to remove that.
+
+```{r}
+data %>%
+  select(-gene_id) -> data
+```
+
+Our outcome column needs to be a factor
+
+```{r}
+data %>%
+  mutate(transmembrane = factor(transmembrane)) -> data
+```
+
+Remove any missing values
+
+```{r}
+data %>%
+  na.omit() -> data
+```
+
+
+
+We also want the data to be in random order so that the order doesn't affect the learning.  We'll set a random seed so this step is reproducible
+
+```{r}
+set.seed(1234)
+data %>%
+  sample_frac() -> data
+
+head(data)
+```
+
+
+Exploring Data
+==============
+
+Counting cases
+--------------
+
+Let's see how imbalanced the abundances of the different categories are.
+
+```{r}
+data %>%
+  group_by(transmembrane) %>% 
+  count()
+```
+
+Not too bad.  Transmembrane proteins make up about a quarter of all proteins so there should be plenty of cases to work with.
+
+Simple explanations
+-------------------
+
+Before we bother doing machine learning let's see if we can cleanly identify transmembrane proteins from any of the existing variables.  We can try some obvious ones.
+
+### GC
+
+```{r}
+data %>%
+  ggplot(aes(x=transmembrane, y=GC)) +
+  geom_jitter(colour="grey", size=0.5) + 
+  geom_violin(fill=NA, linewidth=1)
+```
+
+### Gene Length
+
+```{r}
+data %>%
+  ggplot(aes(x=transmembrane, y=gene_length)) +
+  geom_jitter(colour="grey", size=0.5) + 
+  geom_violin(fill=NA, linewidth=1)
+```
+
+No drastic difference.  We can see that for quantitative models we might want this to be on a log scale
+
+### Transcript Length
+
+```{r}
+data %>%
+  ggplot(aes(x=transmembrane, y=transcript_length)) +
+  geom_jitter(colour="grey", size=0.5) + 
+  geom_violin(fill=NA, linewidth=1)
+```
+
+Again, this could be log transformed for quantitative models, but we're starting with a model which doesn't care, so we don't need to do anything immediately.
+
+
+### Amino Acid Content
+
+```{r fig.height=10, fig.width=10}
+data %>%
+  select(transmembrane,A:last_col()) %>%
+  pivot_longer(
+    cols=-transmembrane,
+    names_to="Amino Acid",
+    values_to="Percentage"
+  ) %>%
+  ggplot(aes(x=transmembrane,y=Percentage)) +
+  geom_jitter(colour="grey", size=0.5) + 
+  geom_violin(fill=NA, linewidth=1) +
+  facet_wrap(vars(`Amino Acid`))
+```
+
+Some differences here, but nothing which is individually useful, so a more complex model will be needed.
+
+
+Random Forest
+=============
+
+Let's try a random forest. The nice thing about this is that we don't need to convert any of the column data types as it's just as happy with categorical data as quantitative.  It also doesn't care about the distribution of values so we can put any quantitative measures into there too.
+
+
+Prepare the data
+----------------
+
+```{r}
+set.seed(4566)
+data %>% 
+  initial_split(prop=0.8, strata=transmembrane) -> split_data
+
+split_data
+
+training(split_data) %>%
+  group_by(transmembrane) %>%
+  count()
+
+testing(split_data) %>%
+  group_by(transmembrane) %>%
+  count()
+```
+
+We have a nice even split of the data between training and testing.
+
+
+Create the model
+----------------
+
+```{r}
+rand_forest(engine="ranger", trees=100) %>%
+  set_mode("classification") -> forest_model
+
+forest_model %>%
+  translate()
+
+```
+
+Train the model
+---------------
+
+```{r}
+forest_model %>%
+  fit(transmembrane ~ ., data=training(split_data)) -> forest_fit
+
+forest_fit
+```
+
+Test the model
+--------------
+
+```{r}
+forest_fit %>%
+  predict(new_data=testing(split_data)) %>%
+  bind_cols(testing(split_data)) -> forest_test_results
+
+head(forest_test_results)
+```
+
+Get some metrics
+
+```{r}
+forest_test_results %>%
+  group_by(.pred_class,transmembrane) %>%
+  count() %>%
+  pivot_wider(
+    names_from=.pred_class,
+    values_from=n,
+    names_prefix = "predicted_"
+  ) %>%
+  rename(true_transmembrane=transmembrane)
+```
+
+```{r}
+forest_test_results %>%
+  metrics(transmembrane, .pred_class)
+```
+
+```{r}
+forest_test_results %>%
+  sens(transmembrane, .pred_class)
+```
+
+
+```{r}
+forest_test_results %>%
+  spec(transmembrane, .pred_class)
+```
+
+We could try to optimise this by playing around with the number of trees or the number of parameters randomly selected for each decision point, but the basic prediction is not terrible.
+
+
+Neural Network
+==============
+
+The random forest did a pretty good job at predicting transmembrane proteins.  Let's see if a different modelling strategy would do any better.
+
+
+Building a Recipe
+-----------------
+
+Our data preparation for the neural net is going to be a bit more involved.  Neural nets require that all variables are numeric, which ours are not (chr, TSL etc.), and we want our quantitative values to all be scaled and centered.  To do this we're going to use a recipe.
+
+```{r}
+recipe(
+  transmembrane ~ ., data=training(split_data)
+) -> neural_recipe
+
+neural_recipe
+```
+
+Now we have a recipe we can add some relevant steps.  Things we want to do are:
+
+1. Log transform the gene and transcript length parameters
+2. Scale and center the quantitative values
+2. Turn all text columns into numeric values
+
+```{r}
+neural_recipe %>%
+  step_log(gene_length, transcript_length) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors()) -> neural_recipe
+
+neural_recipe
+```
+
+Building the model
+------------------
+
+Now we have a recipe we'll create the model we're going to use, in this case a neural net.
+
+```{r}
+mlp(epochs = 1000, hidden_units = 10, penalty = 0.01, learn_rate = 0.01) %>% 
+  set_engine("brulee", validation = 0) %>% 
+  set_mode("classification") -> nnet_model
+
+nnet_model
+```
+
+Build a workflow
+----------------
+
+To tie everything together we can build a workflow.  We could use the ```juice``` function to run the recipe directly to avoid having to use a workflow but it's easier to automate it in this way.
+
+```{r}
+workflow() %>%
+  add_recipe(neural_recipe) %>%
+  add_model(nnet_model) -> neural_workflow
+
+neural_workflow
+```
+
+Train the model
+---------------
+
+It's all prepared so we can go ahead and train the model by running the workflow.
+
+```{r}
+
+fit(neural_workflow,data=training(split_data)) -> neural_fit
+
+neural_fit
+```
+
+Predicting
+----------
+
+We can now use the workflow to make predictions from our testing data
+
+```{r}
+predict(neural_fit, new_data=testing(split_data)) %>%
+  bind_cols(testing(split_data)) %>%
+  select(.pred_class, transmembrane) -> neural_predictions
+
+neural_predictions
+```
+
+The workflow will do the transformations to the testing data automatically.  We're binding to the untransformed data, but the only information we really need are the truth values anyway so it doesn't really matter.
+
+We can now see how well it did using the same code we used for the random forest.
+
+```{r}
+neural_predictions %>%
+  group_by(.pred_class,transmembrane) %>%
+  count() %>%
+  pivot_wider(
+    names_from=.pred_class,
+    values_from=n,
+    names_prefix = "predicted_"
+  ) %>%
+  rename(true_transmembrane=transmembrane)
+```
+
+```{r}
+neural_predictions %>%
+  metrics(transmembrane, .pred_class)
+```
+
+```{r}
+neural_predictions %>%
+  sens(transmembrane, .pred_class)
+```
+
+
+```{r}
+neural_predictions %>%
+  spec(transmembrane, .pred_class)
+```
+
+
+
+

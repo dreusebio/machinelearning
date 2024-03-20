@@ -1,0 +1,78 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+tidymodels_prefer()
+```
+
+Load the Data
+=============
+
+```{r}
+read_delim("../development_gene_expression.txt") -> data
+
+# The predicted variable needs to be factor
+data %>%
+  mutate(Development=factor(Development)) %>%
+  select(Development,everything()) -> data
+
+# We want to randomly shuffle the rows so there is no structure
+set.seed(123)
+data %>%
+  sample_frac() -> data
+
+head(data)
+
+```
+
+We're going to do proper cross validation so we need to split into 10 chunks
+
+```{r}
+data %>%
+  vfold_cv(v = 10) -> cv_data
+```
+
+Set the main options
+====================
+
+```{r}
+number_of_trees_to_build = 100
+random_predictors_per_node = 20
+minimum_measures_per_node = 5
+```
+
+
+
+
+Random Forest
+-------------
+
+```{r}
+rand_forest(trees=number_of_trees_to_build, min_n=minimum_measures_per_node, mtry=random_predictors_per_node) %>%
+  set_mode("classification") %>%
+  set_engine("ranger") -> model
+
+model %>% translate()
+```
+
+### Train the model
+
+```{r}
+model %>%
+  fit_resamples(Development ~ ., resamples = cv_data) -> model_fit
+
+model_fit
+```
+
+```{r}
+collect_metrics(model_fit) -> model_metrics
+
+model_metrics
+```
+
+
